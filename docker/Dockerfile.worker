@@ -1,0 +1,63 @@
+# Multi-stage build for production optimization
+FROM node:18-alpine AS base
+
+# Install dependencies only when needed
+FROM base AS deps
+WORKDIR /app
+
+# Copy package files
+COPY server/package*.json ./
+
+# Install dependencies
+RUN npm ci --only=production && \
+    npm cache clean --force
+
+# Development stage
+FROM base AS development
+WORKDIR /app
+
+# Copy package files
+COPY server/package*.json ./
+
+# Install all dependencies (including dev)
+RUN npm ci
+
+# Copy application code
+COPY server/ .
+
+# Create logs directory
+RUN mkdir -p logs
+
+# Start worker in development mode
+CMD ["npm", "run", "worker"]
+
+# Production stage
+FROM base AS production
+WORKDIR /app
+
+# Set production environment
+ENV NODE_ENV=production
+
+# Copy dependencies from deps stage
+COPY --from=deps /app/node_modules ./node_modules
+
+# Copy application code
+COPY server/ .
+
+# Create non-root user for security
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001
+
+# Create logs directory and set permissions
+RUN mkdir -p logs && \
+    chown -R nodejs:nodejs /app
+
+# Switch to non-root user
+USER nodejs
+
+# Health check for worker (checks if process is running)
+HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
+    CMD pgrep -f "node.*worker" || exit 1
+
+# Start worker
+CMD ["node", "scripts/start-worker.js"]

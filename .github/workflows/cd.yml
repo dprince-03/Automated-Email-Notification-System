@@ -1,0 +1,302 @@
+name: CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Determine deployment environment
+  setup:
+    name: Setup Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      
+    steps:
+      - name: Determine environment
+        id: set-env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Print deployment info
+        run: |
+          echo "Deploying to: ${{ steps.set-env.outputs.environment }}"
+          echo "Triggered by: ${{ github.event_name }}"
+          echo "Commit: ${{ github.sha }}"
+
+  # Deploy to environment
+  deploy:
+    name: Deploy to ${{ needs.setup.outputs.environment }}
+    runs-on: ubuntu-latest
+    needs: setup
+    environment:
+      name: ${{ needs.setup.outputs.environment }}
+      url: ${{ steps.deploy.outputs.url }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image tags
+        id: tags
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "api_image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-api:main-$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "worker_image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-worker:main-$SHORT_SHA" >> $GITHUB_OUTPUT
+
+      - name: Pull Docker images
+        run: |
+          docker pull ${{ steps.tags.outputs.api_image }}
+          docker pull ${{ steps.tags.outputs.worker_image }}
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add server to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Create deployment package
+        run: |
+          mkdir -p deploy
+          cp docker-compose.yml deploy/
+          cp .env.example deploy/.env
+          
+          # Create deployment script
+          cat > deploy/deploy.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "Starting deployment..."
+          
+          # Pull latest images
+          echo "Pulling Docker images..."
+          docker-compose pull
+          
+          # Run database migrations
+          echo "Running database migrations..."
+          docker-compose run --rm api npm run migrate
+          
+          # Backup current containers
+          echo "Creating backup..."
+          BACKUP_TAG=$(date +%Y%m%d_%H%M%S)
+          docker tag email-notification-api:current email-notification-api:backup-$BACKUP_TAG || true
+          docker tag email-notification-worker:current email-notification-worker:backup-$BACKUP_TAG || true
+          
+          # Deploy with zero downtime (rolling update)
+          echo "Performing rolling update..."
+          
+          # Scale up new API instances
+          docker-compose up -d --scale api=2 --no-recreate
+          sleep 10
+          
+          # Health check
+          echo "Running health checks..."
+          for i in {1..30}; do
+            if curl -f http://localhost:3000/health > /dev/null 2>&1; then
+              echo "Health check passed"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "Health check failed, rolling back..."
+              docker-compose down
+              docker tag email-notification-api:backup-$BACKUP_TAG email-notification-api:current
+              docker tag email-notification-worker:backup-$BACKUP_TAG email-notification-worker:current
+              docker-compose up -d
+              exit 1
+            fi
+            echo "Waiting for service to be ready... ($i/30)"
+            sleep 2
+          done
+          
+          # Scale down old instances
+          docker-compose up -d --scale api=1
+          
+          # Update workers
+          echo "Updating workers..."
+          docker-compose up -d --force-recreate worker
+          
+          # Cleanup old images
+          echo "Cleaning up..."
+          docker image prune -f
+          
+          echo "Deployment completed successfully!"
+          EOF
+          
+          chmod +x deploy/deploy.sh
+
+      - name: Copy files to server
+        run: |
+          scp -r deploy/* ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:/opt/email-notification/
+
+      - name: Deploy application
+        id: deploy
+        run: |
+          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ENDSSH'
+            cd /opt/email-notification
+            
+            # Set environment variables
+            export API_IMAGE=${{ steps.tags.outputs.api_image }}
+            export WORKER_IMAGE=${{ steps.tags.outputs.worker_image }}
+            
+            # Run deployment script
+            bash deploy.sh
+            
+            # Get deployment URL
+            if [[ "${{ needs.setup.outputs.environment }}" == "production" ]]; then
+              echo "url=https://api.yourdomain.com" >> $GITHUB_OUTPUT
+            else
+              echo "url=https://staging-api.yourdomain.com" >> $GITHUB_OUTPUT
+            fi
+          ENDSSH
+
+      - name: Run smoke tests
+        run: |
+          echo "Running smoke tests..."
+          
+          # Wait for service to stabilize
+          sleep 10
+          
+          # Test health endpoint
+          if ! curl -f ${{ steps.deploy.outputs.url }}/health; then
+            echo "Smoke test failed: Health check"
+            exit 1
+          fi
+          
+          echo "Smoke tests passed"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Deployment failed, initiating rollback..."
+          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ENDSSH'
+            cd /opt/email-notification
+            docker-compose down
+            
+            # Restore backup
+            BACKUP_TAG=$(docker images --format "{{.Tag}}" | grep backup | sort -r | head -1)
+            if [ ! -z "$BACKUP_TAG" ]; then
+              docker tag email-notification-api:$BACKUP_TAG email-notification-api:current
+              docker tag email-notification-worker:$BACKUP_TAG email-notification-worker:current
+              docker-compose up -d
+              echo "Rollback completed"
+            else
+              echo "No backup found"
+              exit 1
+            fi
+          ENDSSH
+
+  # Post-deployment tasks
+  post-deploy:
+    name: Post-deployment Tasks
+    runs-on: ubuntu-latest
+    needs: [setup, deploy]
+    if: success()
+    
+    steps:
+      - name: Tag release
+        if: needs.setup.outputs.environment == 'production'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Release v${{ github.run_number }}
+          body: |
+            Automated release from commit ${{ github.sha }}
+            
+            Deployed to: ${{ needs.setup.outputs.environment }}
+            Deployment time: ${{ github.event.head_commit.timestamp }}
+          draft: false
+          prerelease: false
+
+      - name: Send deployment notification
+        run: |
+          echo "Deployment notification"
+          echo "Environment: ${{ needs.setup.outputs.environment }}"
+          echo "Status: Success"
+          echo "Commit: ${{ github.sha }}"
+          echo "Author: ${{ github.actor }}"
+          
+        #   Send to Slack/Discord/Email
+        #   curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+        #     -H 'Content-Type: application/json' \
+        #     -d '{
+        #       "text": "Deployment to ${{ needs.setup.outputs.environment }} successful!",
+        #       "blocks": [
+        #         {
+        #           "type": "section",
+        #           "text": {
+        #             "type": "mrkdwn",
+        #             "text": "*Deployment Complete*\nEnvironment: ${{ needs.setup.outputs.environment }}\nCommit: ${{ github.sha }}\nAuthor: ${{ github.actor }}"
+        #           }
+        #         }
+        #       ]
+        #     }'
+
+      - name: Update deployment status
+        run: |
+          echo "Deployment completed at $(date)"
+          echo "Version: ${{ github.run_number }}"
+          echo "Environment: ${{ needs.setup.outputs.environment }}"
+
+  # Failure notification
+  notify-failure:
+    name: Notify Deployment Failure
+    runs-on: ubuntu-latest
+    needs: [setup, deploy]
+    if: failure()
+    
+    steps:
+      - name: Send failure notification
+        run: |
+          echo "Deployment failed!"
+          echo "Environment: ${{ needs.setup.outputs.environment }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Author: ${{ github.actor }}"
+          
+        #   Send alert
+        #   curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+        #     -H 'Content-Type: application/json' \
+        #     -d '{
+        #       "text": "Deployment to ${{ needs.setup.outputs.environment }} FAILED!",
+        #       "blocks": [
+        #         {
+        #           "type": "section",
+        #           "text": {
+        #             "type": "mrkdwn",
+        #             "text": "*Deployment Failed*\nEnvironment: ${{ needs.setup.outputs.environment }}\nCommit: ${{ github.sha }}\nAuthor: ${{ github.actor }}\n\nCheck logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        #           }
+        #         }
+        #       ]
+        #     }'

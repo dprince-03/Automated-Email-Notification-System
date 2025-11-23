@@ -20,7 +20,7 @@ app.set('trust proxy', 1);
 // Middlewares
 // =====================
 const corsConfig = {
-    origin: process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : ['http://localhost:5000', 'http://localhost:5080'],
+    origin: process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : ['http://localhost:5000', 'http://localhost:5000'],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
     credentials: true,
@@ -47,7 +47,7 @@ const sessionConfig = {
 	resave: false,
 	saveUninitialized: false,
 	cookie: {
-		secure: process.env.NODE_ENV === "development" && process.env.NODE_PROD_ENV === "production",
+		secure: process.env.NODE_ENV === "development" || process.env.NODE_ENV === "production",
 		httpOnly: true,
 		maxAge: 24 * 60 * 60 * 1000, // 24 hours
 	},

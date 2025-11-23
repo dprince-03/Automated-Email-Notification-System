@@ -20,11 +20,15 @@ app.set('trust proxy', 1);
 // Middlewares
 // =====================
 const corsConfig = {
-    origin: process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : ['http://localhost:5000', 'http://localhost:5000'],
+    origin: process.env.NODE_ENV === 'production' ? process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : ['http://localhost:5000', 'http://localhost:5001'] : ['http://localhost:5000', 'http://localhost:5001'],
+
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'X-CSRF-Token'],
+    exposedHeaders: ['Authorization', 'X-CSRF-Token', 'X-Token-Count', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'],
     credentials: true,
-    optionsSuccessStatus: 200,
+    maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    preflightContinue: false,
+    optionsSuccessStatus: 204,
 };
 
 const helmetConfig = {

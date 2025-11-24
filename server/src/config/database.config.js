@@ -13,7 +13,7 @@ const pool = {
     createTimeout: 30000,
     acquireTimeout: 30000,
     destroyTimeout: 5000,
-     healthCheck: true,
+    healthCheck: true,
     maxUses: 7500, // Close connection after 7500 queries
 
     query: {
